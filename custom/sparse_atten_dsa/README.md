@@ -1,22 +1,20 @@
-# DeepSeek V4 Sparse Attention (DSA) — PTO kernel
+# DeepSeek V4 Sparse Attention (DSA) — Ascend 910B PTO kernel
 
-Reference implementation of the DeepSeek V4 / V3.2-Exp **DeepSeek Sparse
-Attention (DSA)** compute path, written in PTO-Auto style on top of the
-PTO Tile intrinsics.
+PTO implementation of the DeepSeek V4 / V3.2-Exp **DeepSeek Sparse Attention
+(DSA)** compute path, mapped to the Ascend 910B AI Core split architecture
+(reference: [arXiv:2505.15112](https://arxiv.org/html/2505.15112v1)).
 
 ## Algorithm
 
 DSA replaces dense softmax attention with two stages:
 
 1. **Lightning Indexer** *(separate kernel, not implemented here)*: a cheap
-   scoring pass that, for each query block, selects `TOP_K` key/value blocks
-   to attend to. Output: `block_indices : [num_q_blocks, TOP_K]` of `int32`.
+   scoring pass that, for each query block, selects `TOP_K` KV blocks to
+   attend to. Output: `block_indices : [num_q_blocks, TOP_K]` of `int32`.
 2. **Sparse attention compute** *(this kernel)*: standard scaled-dot-product
    attention with FlashAttention-2 streaming softmax, but the inner KV loop
    walks the selected blocks listed in `block_indices` instead of all KV
-   blocks.
-
-Per query block:
+   blocks. Per query block:
 
 ```
 m = -inf;  l = 0;  O = 0
@@ -39,48 +37,95 @@ O = O / l
 store O
 ```
 
-`alpha` is the running rescale factor that keeps the streaming softmax
-numerically stable across blocks (FA-2). The first selected block takes the
-init path so we don't multiply by an undefined `m`/`l`/`O`.
+## Mapping to the Ascend 910B AI Core
 
-## Mapping to the PTO programming model
+Each AI Core on 910B is a **1 Cube + 2 Vector** composite (1:2 ratio). The
+two halves have disjoint local memories and can only exchange data through
+GM (or, on-chip, through L2-cached fast paths exposed as the same API).
 
-References below point at the docs that informed each choice.
+This kernel runs as MPMD on a single AI Core, with the same source compiled
+twice — once into the Cube image and once into the Vec image — and the
+`__DAV_CUBE__` / `__DAV_VEC__` predicates select which half runs which work
+at compile time.
 
-| Concept | Mapping in this kernel | Doc |
+### Work assignment
+
+| Stage | Hardware | PTO instructions |
 |---|---|---|
-| Execution model | SPMD: one core per query block (`get_block_idx()`); `kNumQBlocks = S_Q/BQ` cores in the launch grid | [coding/ProgrammingModel.md](../../../docs/coding/ProgrammingModel.md) |
-| Style | **PTO-Auto** — direct `TLOAD → compute → TSTORE` dataflow, no `TASSIGN`, no manual flags | [auto_mode/Auto_Mode_Overview.md](../../../docs/auto_mode/Auto_Mode_Overview.md) |
-| Q / K / V tiles | `Tile<TileType::Mat, __fp16, ...>` with boxed (`SLayout`) layouts so they're legal operands for `TMATMUL` | [coding/Tile.md](../../../docs/coding/Tile.md) |
-| Accumulators | `TileAcc<float, BQ, BK>` for QK and `TileAcc<float, BQ, HEAD>` for PV | [coding/Tile.md](../../../docs/coding/Tile.md) |
-| Per-row state (`m`, `l`, `alpha`) | `Tile<TileType::Vec, float, BQ, 1, BLayout::ColMajor, BQ, 1>` reduce tiles | [coding/Tile.md](../../../docs/coding/Tile.md) |
-| GM views of Q / K / V / O | 5-D `GlobalTensor<...>` with the leading three dims set to 1 | [coding/GlobalTensor.md](../../../docs/coding/GlobalTensor.md) |
-| Sparse KV indexing | Per-iteration scalar GM read of `block_indices[q_block*TOP_K + t]`, then a fresh `GlobalTensor` view at offset `kv_blk * BK * HEAD`. No `MGATHER` needed because each tile is a contiguous block. | [isa/MGATHER.md](../../../docs/isa/MGATHER.md) (only used for elementwise gather; block-level indexing is just pointer arithmetic) |
-| Online softmax math | `TROWMAX`, `TROWEXPANDSUB`, `TEXP`, `TROWSUM`, `TMAX`, `TSUB`, `TMUL`, `TADD`, `TROWEXPANDMUL`, `TROWEXPANDDIV` — same instruction palette as the dense flash_atten softmax helper | [isa/README.md](../../../docs/isa/README.md), [kernels/manual/common/flash_atten/pto_macro_fa_softmax.hpp](../../manual/common/flash_atten/pto_macro_fa_softmax.hpp) |
-| `__PTO_AUTO__` rule compliance | Loop-invariant guards live outside the inner loop; the per-iteration skip uses a single-expression `bool skip` evaluated once before the `if`; no `TASSIGN`, no `set_flag`/`wait_flag` | [auto_mode/Kernel_Developer_Rules_And_Limitations.md](../../../docs/auto_mode/Kernel_Developer_Rules_And_Limitations.md) §1.1, §1.3, §3.3 |
+| Load Q (once) and K[blk] per iteration | Cube | `TLOAD` (Mat tile in L1) |
+| Q @ K^T → fp32 [BQ, BK] | **Cube** | `TMATMUL` (`TileLeft @ TileRight^T → TileAcc`) |
+| FA-2 streaming softmax: rowmax, exp, rowsum, alpha rescale | **Vec** (×2) | `TROWMAX`, `TROWEXPANDSUB`, `TEXP`, `TROWSUM`, `TMAX`, `TSUB`, `TMUL`, `TADD` |
+| P fp32 → fp16 cast | Vec | `TCVT` |
+| Load V[blk]; P @ V → fp32 [BQ, HEAD] | **Cube** | `TLOAD`, `TMATMUL` |
+| Streaming O update: O = α·O + PV; final O /= l | **Vec** (×2) | `TROWEXPANDMUL`, `TADD`, `TROWEXPANDDIV` |
+| Store O | Vec | `TSTORE` |
 
-## What's intentionally left out
+### Vector subblock partitioning (1:2 ratio)
 
-- **Lightning Indexer**: out of scope for this kernel; assumed upstream.
-- **Causal masking**: trivially added if needed (apply `TTRI` + `TMULS(-inf)`
-  + `TADD` to `qk_acc` when `kv_blk*BK <= q_block*BQ + i`). Omitted here to
-  keep the sparse path readable.
-- **Pipelined Cube/Vec MPMD**: the dense flash_atten in
-  [`kernels/manual/common/flash_atten`](../../manual/common/flash_atten) shows
-  what a fully pipelined version looks like with explicit FIFOs, ping-pong
-  L1 buffers, and `TSyncCVID`-driven cross-core handoff. The DSA hot path
-  here is written for clarity in PTO-Auto; the same Cube/Vec split applies
-  identically once the sparse loop body is settled.
-- **Sliding-window / compressed components** of NSA-family designs: those
-  are additional attention paths fused with the selected-blocks path; this
-  kernel implements the selected-blocks path only.
+`BQ` query rows are split row-wise across the two Vec subblocks:
+`BQ_sub = BQ / 2`, with `get_subblockid()` choosing 0 or 1. Each subblock
+maintains its own `m_run`, `l_run`, `alpha`, and resident `o_run` UB tiles
+covering its row range. Since softmax + GU happen on the same vec subblock,
+the per-row state never crosses cores — only Cube↔Vec **tile** data does.
+
+The `TPipe` consumer side declares `TileSplitAxis::TILE_UP_DOWN`, which is
+exactly the primitive in [docs/isa/TALLOC.md](../../../docs/isa/TALLOC.md)
+for "vector subblocks map to row halves."
+
+### Cross-core data movement
+
+All Cube↔Vec data flow goes through GM-backed ring FIFOs declared as
+`TPipe`s and accessed with `TALLOC` / `TPUSH` (producer) and `TPOP` /
+`TFREE` (consumer):
+
+```
+              direction        slot size              role
+QKPipe        Cube → Vec       BQ * BK * f32          QK = Q @ K^T to be softmaxed
+PPipe         Vec  → Cube      BQ * BK * f16          P = softmax(QK), input to PV matmul
+PVPipe        Cube → Vec       BQ * HEAD * f32        PV = P @ V, to be folded into O
+```
+
+Slot size is the full BQ-row tile; the consumer picks its subblock's row
+half via `TILE_UP_DOWN` so the producer doesn't need to know how many vec
+subblocks consume it. Producer/consumer ready notifications are driven by
+the **FFTS** sync mechanism (`set_ffts_base_addr` at kernel entry, distinct
+`FlagID`s per pipe).
+
+### Sparse loop on both cores
+
+Both Cube and Vec read `block_indices[q_block * TOP_K + t]` each iteration
+and skip in lockstep on `kv_blk < 0`. Because both halves walk the same
+selection sequence, the FIFOs stay balanced — no extra control message
+needs to flow when a slot is masked.
+
+### What we did *not* do here (room for further perf tuning)
+
+The dense [`kernels/manual/common/flash_atten`](../../manual/common/flash_atten)
+reference layers several perf optimizations on top of this same Cube/Vec
+split. They are intentionally omitted here so the architecture mapping
+stays readable; each is a knob the kernel can adopt with minimal logic
+change:
+
+- **Pipeline preload** of `QK_PRELOAD` tiles before the steady-state loop,
+  to fill the FIFOs and hide the first iteration's matmul latency.
+- **Ping-pong L1 / L0 buffers** for K, P, V, and the QK/PV accumulators
+  (`L0A_BUF0/1`, `L0C_BUF0/1`).
+- **Sub-tile factor** (`Tile_S1 / Cube_S1`) so a single QK FIFO entry
+  represents multiple cube tiles, amortising notification cost.
+- **Causal masking**: trivially added by ORing a `TTRI`-generated upper-tri
+  mask × `-inf` into `qk_acc` when `kv_blk * BK <= q_block * BQ + i`.
+- **Lightning Indexer** itself — out of scope for this kernel.
 
 ## Files
 
-- `sparse_atten_dsa_kernel.h` — host-facing launch wrapper signature.
-- `sparse_atten_dsa_kernel.cpp` — kernel + softmax helper + explicit template
-  instantiations for common DeepSeek V4 configs (`HEAD=128`, `BQ=BK=64`,
-  `TOP_K=64`).
+- `sparse_atten_dsa_kernel.h` — host-facing launch wrapper signature
+  (FFTS pointer + three FIFO buffers in addition to Q/K/V/indices/O).
+- `sparse_atten_dsa_kernel.cpp` — the kernel: four `compute_*` helpers
+  (one per pipeline stage) plus the SPMD entry point that dispatches them
+  via `__DAV_CUBE__` / `__DAV_VEC__`.
+- Shares the softmax helper (`pto_macro_fa_softmax.hpp`) and matmul helper
+  (`pto_macro_matmul.hpp`) and GU helper (`pto_macro_fa_gu.hpp`) with the
+  dense flash_atten reference.
 
 ## Suggested configurations
 
@@ -91,6 +136,6 @@ References below point at the docs that informed each choice.
 | 16384  | 65536   | 128    | 64   | 64   | 64      | long-context regime where DSA wins most |
 
 `BK = 64` matches the indexer block size used in the DeepSeek V3.2-Exp
-report; `TOP_K = 64` keeps roughly `O(S_Q * TOP_K * BK) = O(S_Q * 4096)`
+report; `TOP_K = 64` keeps roughly `O(S_Q · TOP_K · BK) = O(S_Q · 4096)`
 attention work per layer regardless of `S_KV`, which is the whole point of
 DSA at long context.
